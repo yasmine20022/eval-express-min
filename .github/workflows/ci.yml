@@ -1,0 +1,127 @@
+name: CI/CD to Minikube
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install
+          elif [ -f yarn.lock ]; then
+            command -v yarn >/dev/null 2>&1 || npm install -g yarn
+            yarn install --frozen-lockfile || yarn install
+          elif [ -f pnpm-lock.yaml ]; then
+            # Pin pnpm@9 (supports Node 18+): pnpm@latest needs Node >= 22.13
+            # (node:sqlite) and crashes on Node 20 with ERR_UNKNOWN_BUILTIN_MODULE.
+            # `corepack enable` CREATES the pnpm shim on PATH (on GitHub-hosted
+            # runners `corepack prepare --activate` alone does NOT → "pnpm: command
+            # not found"); `prepare --activate` then pins the version. Fallback to a
+            # forced global install if corepack is unavailable.
+            corepack enable 2>/dev/null || true
+            corepack prepare pnpm@9.15.9 --activate 2>/dev/null || npm install -g pnpm@9 --force 2>/dev/null || true
+            pnpm config set dangerously-allow-all-builds true 2>/dev/null || true
+            pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
+          elif [ -f package.json ]; then
+            npm install
+          fi
+      - name: Build Docker image
+        run: docker build -t eval-express-min:latest .
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Start Minikube
+        uses: medyagh/setup-minikube@latest
+      - name: Build image inside Minikube
+        run: |
+          eval $(minikube docker-env)
+          docker build -t eval-express-min:latest .
+      - name: Create Kubernetes manifest
+        run: |
+          mkdir -p /tmp/devops-autopilot-k8s
+          cat > /tmp/devops-autopilot-k8s/deployment.yaml <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: eval-express-min
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: eval-express-min
+            template:
+              metadata:
+                labels:
+                  app: eval-express-min
+              spec:
+                containers:
+                  - name: eval-express-min
+                    image: eval-express-min:latest
+                    imagePullPolicy: Never
+                    ports:
+                      - containerPort: 8000
+                    readinessProbe:
+                      tcpSocket:
+                        port: 8000
+                      initialDelaySeconds: 5
+                      periodSeconds: 5
+                    livenessProbe:
+                      tcpSocket:
+                        port: 8000
+                      initialDelaySeconds: 15
+                      periodSeconds: 10
+          EOF
+      - name: Deploy to Minikube
+        run: |
+          if [ -d k8s ]; then
+            kubectl apply -f k8s/
+          else
+            kubectl apply -f /tmp/devops-autopilot-k8s/deployment.yaml
+          fi
+      - name: Expose app inside cluster
+        run: |
+          kubectl expose deployment eval-express-min \
+            --name=eval-express-min \
+            --type=ClusterIP \
+            --port=80 \
+            --target-port=8000 \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/eval-express-min --timeout=120s
+      - name: Smoke test deployed app
+        run: |
+          kubectl port-forward service/eval-express-min 18080:80 > /tmp/eval-express-min-port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill $PF_PID 2>/dev/null || true' EXIT
+
+          for path in /health /health/ /; do
+            for attempt in $(seq 1 20); do
+              if curl -fsS "http://127.0.0.1:18080$path" >/tmp/eval-express-min-response.txt; then
+                echo "Smoke test passed on $path"
+                exit 0
+              fi
+              sleep 2
+            done
+          done
+
+          echo "Smoke test failed: app did not return a successful HTTP response."
+          cat /tmp/eval-express-min-port-forward.log || true
+          kubectl get pods -o wide
+          kubectl describe deployment eval-express-min
+          kubectl logs deployment/eval-express-min --tail=100 || true
+          exit 1
