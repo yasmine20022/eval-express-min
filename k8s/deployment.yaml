@@ -4,9 +4,8 @@ metadata:
   name: eval-express-min
   labels:
     app.kubernetes.io/name: eval-express-min
-    app.kubernetes.io/component: web
+    app.kubernetes.io/instance: eval-express-min
     app.kubernetes.io/part-of: eval-express-min
-    app.kubernetes.io/managed-by: kubectl
 spec:
   replicas: 1
   selector:
@@ -22,9 +21,8 @@ spec:
       labels:
         app: eval-express-min
         app.kubernetes.io/name: eval-express-min
-        app.kubernetes.io/component: web
+        app.kubernetes.io/instance: eval-express-min
         app.kubernetes.io/part-of: eval-express-min
-        app.kubernetes.io/managed-by: kubectl
     spec:
       containers:
       - name: eval-express-min
@@ -52,8 +50,8 @@ spec:
             path: /health
             port: 8000
           initialDelaySeconds: 5
-          periodSeconds: 5
-          timeoutSeconds: 3
+          periodSeconds: 10
+          timeoutSeconds: 5
           failureThreshold: 3
         startupProbe:
           httpGet:
